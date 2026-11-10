@@ -1,0 +1,5 @@
+{
+    "enabled": true,
+    "extra_priority_after_minutes": 60,
+    "overdue_weight": 0.25
+}

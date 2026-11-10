@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+meta.json
+*.ankiaddon
+.venv/
+.test-work/
