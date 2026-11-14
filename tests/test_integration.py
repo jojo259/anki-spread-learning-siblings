@@ -167,6 +167,113 @@ class Integration(unittest.TestCase):
         self.assertEqual(before, self.rows())
         self.assertEqual(status, self.col._backend.get_undo_status().SerializeToString())
 
+    def leave_and_reopen(self, did=None):
+        did = did or self.col.decks.current()['id']
+        gui_hooks.reviewer_will_end()
+        self.r.card = None
+        # Use the same native deck-selection operation as the deck list UI.
+        changes = self.col._backend.set_current_deck(did)
+        gui_hooks.operation_did_execute(changes, None)
+        return self.fetch()
+
+    def test_resume_unanswered_learning_card_after_leaving(self):
+        card = self.fetch()
+        history = tuple(sls.engine.session(self.col).history)
+        before = self.rows()
+        for _ in range(5):
+            self.assertEqual(self.leave_and_reopen().id, card.id)
+            self.assertEqual(tuple(sls.engine.session(self.col).history), history)
+        self.assertEqual(before, self.rows())
+        # Deck selection can affect undo status; selection itself cannot add reviews.
+        self.assertEqual(self.col.db.scalar('select count(*) from revlog'), 0)
+
+    def test_resume_unanswered_filtered_card_after_leaving(self):
+        self.filtered(mixed=True)
+        card = self.fetch()
+        for _ in range(4):
+            self.assertEqual(self.leave_and_reopen().id, card.id)
+        before = self.rows()
+        self.answer()
+        self.col.undo()
+        self.assertEqual(before, self.rows())
+        self.assertEqual(self.fetch().id, card.id)
+
+    def test_resume_preview_card_after_leaving(self):
+        self.filtered(preview=True)
+        card = self.fetch()
+        self.assertEqual(self.leave_and_reopen().id, card.id)
+        self.answer(CardAnswer.AGAIN)
+        self.assertNotEqual(self.leave_and_reopen().id, card.id)
+
+    def test_resume_per_deck_after_studying_another_deck(self):
+        if tr:
+            self.filtered()
+        first = self.fetch()
+        first_did = self.col.decks.current()['id']
+        other = self.col.decks.id('Other synthetic')
+        note = self.col.new_note(self.col.models.by_name('Basic (and reversed card)'))
+        note['Front'] = 'Other deck'
+        self.col.add_note(note, other)
+        cards = note.cards()
+        for card in cards:
+            card.type = card.queue = 1
+            card.due = int(time.time())-500
+            card.left = 2002
+        self.col.update_cards(cards)
+        second = self.leave_and_reopen(other)
+        self.assertNotEqual(second.id, first.id)
+        self.assertEqual(self.leave_and_reopen(first_did).id, first.id)
+        self.assertEqual(self.leave_and_reopen(other).id, second.id)
+        self.assertEqual(self.leave_and_reopen(first_did).id, first.id)
+        self.assertEqual(self.leave_and_reopen(other).id, second.id)
+        self.answer(CardAnswer.EASY)
+        self.col.undo()
+        self.assertEqual(self.leave_and_reopen(first_did).id, first.id)
+
+    def test_resume_discarded_when_card_unavailable(self):
+        for change in ('bury', 'suspend', 'delete', 'future'):
+            with self.subTest(change=change):
+                card = self.fetch()
+                cid = card.id
+                if change == 'bury':
+                    self.col.sched.bury_cards([cid])
+                elif change == 'suspend':
+                    self.col.sched.suspend_cards([cid])
+                elif change == 'delete':
+                    self.col.remove_notes([card.nid])
+                else:
+                    card.due = int(time.time())+600
+                    self.col.update_card(card)
+                next_card = self.leave_and_reopen()
+                self.assertTrue(next_card is None or next_card.id != cid)
+                pending = sls.engine.session(self.col).pending.values()
+                self.assertFalse(any(p.state[0] == cid for p in pending))
+
+    def test_resume_after_text_edit_and_then_answer_undo(self):
+        card = self.fetch()
+        note = self.col.get_note(card.nid)
+        note['Front'] += ' edited'
+        self.col.update_note(note)
+        self.assertEqual(self.leave_and_reopen().id, card.id)
+        before = self.rows()
+        self.answer(CardAnswer.EASY)
+        self.assertNotEqual(self.leave_and_reopen().id, card.id)
+        self.col.undo()
+        self.assertEqual(self.rows(), before)
+        self.assertEqual(self.fetch().id, card.id)
+
+    @unittest.skipUnless(tr, 'True Random compatibility scenario')
+    def test_resume_tracks_final_spacing_choice_in_both_addons(self):
+        self.filtered()
+        native = self.col.sched.get_queued_cards().cards[0]
+        # Force spacing to replace True Random's first suggestion.
+        sls.engine.session(self.col).history[:] = [native.card.note_id]
+        card = self.fetch()
+        self.assertNotEqual(card.nid, native.card.note_id)
+        self.assertEqual(self.col.sched._true_random_session.pending[card.did][0], card.id)
+        self.assertEqual(sls.engine.session(self.col).pending[card.did].state[0], card.id)
+        self.assertEqual(self.leave_and_reopen().id, card.id)
+
     def test_whole_learning_session_hard_rule_undo_redo(self):
         snapshots = []
         last = None
@@ -212,6 +319,7 @@ class Integration(unittest.TestCase):
                         before = self.rows()
                         card = self.fetch()
                         cid = card.id
+                        self.assertEqual(self.leave_and_reopen().id, cid)
                         self.answer(rating)
                         after = self.rows()
                         self.col.undo()

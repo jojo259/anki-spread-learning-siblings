@@ -15,6 +15,15 @@ log = logging.getLogger(__name__)
 MASK = (1 << 64)-1
 
 
+def resume_state(col, cid):
+    """Scheduling identity; text edits and unchanged-card saves do not expire it."""
+    row = col.db.first(
+        'select id, did, type, queue, due, ivl, factor, reps, lapses, left, odue, odid '
+        'from cards where id = ?', cid,
+    )
+    return tuple(row) if row else None
+
+
 def materialize(col, cid):
     """Get native states for ONE chosen card, avoiding a full-state queue scan.
 
@@ -68,6 +77,12 @@ def materialize(col, cid):
 
 
 @dataclass
+class Pending:
+    state: tuple
+    before: tuple[int, ...]
+
+
+@dataclass
 class Session:
     history: list[int] = field(default_factory=list)
     current_id: int | None = None
@@ -77,6 +92,12 @@ class Session:
     force_id: int | None = None
     undo_records: dict = field(default_factory=dict)
     failed: bool = False
+    pending: dict[int, Pending] = field(default_factory=dict)
+
+    def forget(self, cid):
+        for did, pending in list(self.pending.items()):
+            if pending.state[0] == cid:
+                del self.pending[did]
 
     def release_current(self):
         self.current_id = None
@@ -129,12 +150,24 @@ class Engine:
         true_random = bool(deck.get('dyn') and str(did) in col.get_config('true_random_filtered_decks', [])
                            and hasattr(col.sched, '_true_random_session'))
         base = reviewer._v3.top_card()
-        if not true_random and base.card.queue != 1 and not session.force_id:
+        pending = session.pending.get(did)
+        if pending and resume_state(col, pending.state[0]) != pending.state:
+            del session.pending[did]
+            if session.current_id == pending.state[0]:
+                session.release_current()
+            pending = None
+        if (not true_random and base.card.queue != 1 and not session.force_id
+                and not (pending and pending.state[3] == 1)):
             session.release_current()
             return
         now = int(time.time())
         rows = self.rows(col, true_random, now)
         by_id = {row[0]: row for row in rows}
+        if pending and pending.state[0] not in by_id:
+            del session.pending[did]
+            if session.current_id == pending.state[0]:
+                session.release_current()
+            pending = None
         cid = base.card.id
         if session.force_id is not None:
             # Undo explicitly reopens the reverted card instead of treating it
@@ -143,6 +176,8 @@ class Engine:
             session.force_id = None
             if force in by_id:
                 cid = force
+        elif pending:
+            cid = pending.state[0]
         elif session.current_id in by_id:
             cid = session.current_id
         elif rows:
@@ -171,20 +206,29 @@ class Engine:
             card.start_timer()
             reviewer._v3 = v3
             reviewer.card = card
-        if session.current_id != cid:
+        if pending and cid == pending.state[0]:
+            # Reopening an unanswered question is the same exposure. Preserve
+            # its original undo snapshot and do not add it to spacing history.
+            session.before_current = pending.before
+            session.shown_id = cid
+        elif session.current_id != cid:
             session.before_current = tuple(session.history)
         session.current_id = cid
 
     def shown(self, col, card):
         session = self.session(col)
-        if not self.settings.enabled or session.failed or session.shown_id == card.id:
+        if not self.settings.enabled or session.failed:
             return
-        if session.current_id != card.id:
-            session.before_current = tuple(session.history)
-            session.current_id = card.id
-        session.history.append(card.nid)
-        session.history[:] = session.history[-64:]
-        session.shown_id = card.id
+        if session.shown_id != card.id:
+            if session.current_id != card.id:
+                session.before_current = tuple(session.history)
+                session.current_id = card.id
+            session.history.append(card.nid)
+            session.history[:] = session.history[-64:]
+            session.shown_id = card.id
+        state = resume_state(col, card.id)
+        if state:
+            session.pending[col.decks.current()['id']] = Pending(state, session.before_current)
 
     def answered(self, col, card):
         session = self.session(col)
@@ -194,11 +238,13 @@ class Engine:
         session.undo_records[counter] = (card.id, session.before_current, tuple(session.history))
         while len(session.undo_records) > 100:
             session.undo_records.pop(next(iter(session.undo_records)))
+        session.forget(card.id)
         session.release_current()
 
     def undone(self, col, out, redo=False):
         session = self.session(col)
         session.release_current()
+        session.pending.pop(col.decks.current()['id'], None)
         record = session.undo_records.get(out.counter)
         if record:
             cid, before, after = record
